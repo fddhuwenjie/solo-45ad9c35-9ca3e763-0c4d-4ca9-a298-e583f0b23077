@@ -1,0 +1,23 @@
+body { background:#1b1b1f; color:#ddd; font:14px/1.5 "PingFang SC","Microsoft YaHei",sans-serif; margin:0; padding:16px; }
+header { display:flex; align-items:baseline; gap:16px; }
+h1 { font-size:20px; margin:0; }
+h2 { font-size:15px; color:#aaa; margin:12px 0 6px; }
+#version { color:#e8b13c; font-family:monospace; }
+section { margin:12px 0; }
+label { margin-right:14px; white-space:nowrap; }
+input, select { background:#2a2a30; color:#ddd; border:1px solid #444; padding:3px 6px; width:90px; }
+select#segSelect { width:160px; }
+button { background:#3a3a44; color:#eee; border:1px solid #555; padding:4px 12px; cursor:pointer; }
+button:hover { background:#4a4a56; }
+button.tool.active { background:#e8b13c; color:#111; }
+.hint { color:#777; font-size:12px; margin-left:12px; }
+canvas { display:block; background:#101014; border:1px solid #333; cursor:crosshair; }
+#ruler { cursor:default; }
+#lockState { margin-left:12px; font-weight:bold; }
+#lockState.locked { color:#7fd07f; }
+#slip { color:#ff7766; font-weight:bold; min-height:20px; }
+#errors { color:#ffaa55; white-space:pre-line; }
+#errors:empty { display:none; }
+#svg { display:block; margin:8px 0; border:1px solid #333; }
+#json { background:#101014; border:1px solid #333; padding:8px; max-height:260px; overflow:auto; font-size:12px; }
+#actionForm input { width:70px; }

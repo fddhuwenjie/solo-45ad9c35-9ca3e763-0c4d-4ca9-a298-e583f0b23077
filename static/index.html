@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>走带编排 · 胶片修复</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>走带编排</h1>
+  <span id="version"></span>
+</header>
+
+<section id="params">
+  <label>片宽 mm <input id="p_width" type="number" step="0.1"></label>
+  <label>标称节距 mm <input id="p_pitch" type="number" step="0.01"></label>
+  <label>窗口偏移 mm <input id="p_woff" type="number" step="0.1"></label>
+  <label>窗口尺寸 mm <input id="p_wsize" type="number" step="0.1"></label>
+  <label>牵引上限 mm <input id="p_trac" type="number" step="0.1"></label>
+  <button id="saveParams">保存参数</button>
+</section>
+
+<section id="segments">
+  <select id="segSelect"></select>
+  <input id="newSegName" placeholder="新段名称">
+  <button id="addSeg">建段</button>
+  <button id="lockSeg">锁定该段</button>
+  <button id="unlockSeg">解锁</button>
+  <span id="lockState"></span>
+</section>
+
+<section id="toolbar">
+  点取工具：
+  <button data-kind="sprocket" class="tool active">齿孔中心</button>
+  <button data-kind="splice" class="tool">接片</button>
+  <button data-kind="notch" class="tool">缺口</button>
+  <button data-kind="warp" class="tool">翘曲</button>
+  <button data-kind="brittle" class="tool">脆化边</button>
+  <span class="hint">点击条带放置；右键删除最近测量点</span>
+</section>
+
+<canvas id="strip" width="1100" height="240"></canvas>
+
+<section id="timeline">
+  <h2>时间尺</h2>
+  <div id="actionForm">
+    <input id="a_frame" type="number" placeholder="帧号" min="0">
+    <select id="a_type">
+      <option value="slow">降速</option>
+      <option value="skip">空过一齿</option>
+      <option value="hold">停机托带</option>
+    </select>
+    <input id="a_factor" type="number" step="0.1" placeholder="倍率" title="降速倍率">
+    <input id="a_span" type="number" min="1" placeholder="跨帧" title="托带跨帧数">
+    <input id="a_resume" type="number" step="0.01" placeholder="恢复时码" title="托带后时码从此值续走">
+    <button id="addAction">插入动作</button>
+  </div>
+  <canvas id="ruler" width="1100" height="70"></canvas>
+</section>
+
+<section id="results">
+  <h2>复算结果 <button id="recompute">复算</button></h2>
+  <div id="slip"></div>
+  <div id="errors"></div>
+  <img id="svg" alt="偏移曲线">
+  <pre id="json"></pre>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
