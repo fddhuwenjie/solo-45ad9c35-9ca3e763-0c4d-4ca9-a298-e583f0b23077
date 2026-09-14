@@ -84,23 +84,26 @@ def build_frames(params, measurements, actions, anchor_id=None, prefix=None):
         f["skipped"] = skip
         tc = resume if resume is not None else tc + dt
 
-    # 首个失步位置：偏移量首次越过牵引上限
-    first_slip = None
-    for f in frames:
-        if abs(f["offset"]) > traction:
-            first_slip = {"frame": f["frame"], "x": f["x"],
-                          "offset": f["offset"]}
-            break
-
-    # 锚点续算：anchor 之前用缓存帧，之后以 anchor 为零点重算
-    if anchor_id is not None and prefix:
+    # 锚点续算：先按当前参数建立全段一致基准，再以锚点为零点续算后方。
+    # 版本匹配时锚点前沿直接取缓存前缀；版本已变则用本次全段重算的前段
+    # （同为当前参数基准），锚点当次即生效。
+    if anchor_id is not None:
         cut = next((i for i, f in enumerate(frames)
                     if f["sprocket_id"] == anchor_id), None)
         if cut is not None and cut > 0:
             base = frames[cut]["offset"]
             for f in frames[cut:]:
                 f["offset"] -= base
-            frames = prefix[:cut] + frames[cut:]
+            if prefix:
+                frames = prefix[:cut] + frames[cut:]
+
+    # 首个失步位置：偏移量首次越过牵引上限（在最终帧列上判定）
+    first_slip = None
+    for f in frames:
+        if abs(f["offset"]) > traction:
+            first_slip = {"frame": f["frame"], "x": f["x"],
+                          "offset": f["offset"]}
+            break
 
     return frames, first_slip
 
