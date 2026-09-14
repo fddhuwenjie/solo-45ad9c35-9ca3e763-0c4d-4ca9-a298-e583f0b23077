@@ -135,23 +135,30 @@ def validate_lock(params, measurements, actions):
                           % (gap, MAX_GAP_PITCHES))
             break
 
-    # 4. 托带动作跨过脆裂边
+    # 4. 托带动作跨过脆裂边：按相邻齿孔的实测坐标界定托带跨度
+    frames, _ = build_frames(params, measurements, actions)
     brittle = markers(measurements, "brittle")
-    if brittle and sprockets:
-        x0 = sprockets[0]["x"]
+    if brittle and frames:
         for a in actions:
             if a["type"] != ACTION_HOLD:
                 continue
+            i0 = a["frame_index"]
+            if i0 >= len(frames):
+                continue
             span = a.get("span", 1)
-            xa = x0 + a["frame_index"] * nominal
-            xb = xa + span * nominal
+            xa = frames[i0]["x"]                 # 托带起点：实测齿孔位
+            end = i0 + span
+            if end < len(frames):
+                xb = frames[end]["x"]            # 终点：下一实测齿孔位
+            else:
+                xb = frames[-1]["x"] + frames[-1]["pitch"]
             for br in brittle:
-                if xa < br["x"] < xb:
-                    errors.append("托带动作（帧 %d，跨 %d 帧）跨过脆裂边 x=%.2f"
-                                  % (a["frame_index"], span, br["x"]))
+                if xa <= br["x"] <= xb:
+                    errors.append("托带动作（帧 %d，跨 %d 帧）实测跨度 "
+                                  "%.2f–%.2fmm 跨过脆裂边 x=%.2f"
+                                  % (a["frame_index"], span, xa, xb, br["x"]))
 
     # 5. 校正时码重叠
-    frames, _ = build_frames(params, measurements, actions)
     tcs = [f["tc"] for f in frames if not f.get("skipped")]
     if any(b <= a for a, b in zip(tcs, tcs[1:])):
         errors.append("校正时码重叠：存在非递增时码")

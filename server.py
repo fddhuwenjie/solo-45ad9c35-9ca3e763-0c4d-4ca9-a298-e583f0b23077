@@ -98,7 +98,14 @@ def compute_segment(conn, seg_id):
         return None
     meas = get_measurements(conn, seg_id)
     acts = get_actions(conn, seg_id)
-    prefix = json.loads(seg["compute_cache"]) if seg["compute_cache"] else None
+    # 缓存前缀只在同一参数版本下有效；版本不同则整段按当前参数重算，
+    # 保证同一结果是单一计算基准，不拼合两个版本的帧。
+    prefix = None
+    if seg["compute_cache"]:
+        cache = json.loads(seg["compute_cache"])
+        if (isinstance(cache, dict)
+                and cache.get("version") == params["version"]):
+            prefix = cache["frames"]
     frames, first_slip = compute.build_frames(
         params, meas, acts, anchor_id=seg["anchor_id"], prefix=prefix)
     errors = compute.validate_lock(params, meas, acts)
@@ -290,7 +297,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json({"locked": False,
                                            "errors": result["lock_errors"]},
                                           422)
-                    cache = json.dumps(result["frames"])
+                    cache = json.dumps({"version": result["version"],
+                                        "frames": result["frames"]})
                     conn.execute(
                         "UPDATE segments SET locked = 1, compute_cache = ?"
                         " WHERE id = ?", (cache, seg_id))
@@ -304,12 +312,19 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"locked": False})
 
                 if sub == "anchor":
-                    # 改锚点只续算后方：锚点前沿用缓存帧
+                    # 改锚点只续算后方：参数版本未变时锚点前沿用缓存帧，
+                    # 版本已变则整段按当前参数重算（单一基准）。
+                    mid = body.get("measurement_id")
                     conn.execute(
                         "UPDATE segments SET anchor_id = ? WHERE id = ?",
-                        (int(body["measurement_id"]), seg_id))
+                        (int(mid) if mid is not None else None, seg_id))
+                    result = compute_segment(conn, seg_id)
+                    conn.execute(
+                        "UPDATE segments SET compute_cache = ? WHERE id = ?",
+                        (json.dumps({"version": result["version"],
+                                     "frames": result["frames"]}), seg_id))
                     conn.commit()
-                    return self._json(compute_segment(conn, seg_id))
+                    return self._json(result)
         finally:
             conn.close()
         self._json({"error": "not found"}, 404)
@@ -331,6 +346,12 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
                 return self._json({"deleted": True})
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "actions":
+                seg = conn.execute(
+                    "SELECT s.locked FROM segments s JOIN actions a"
+                    " ON a.segment_id = s.id WHERE a.id = ?",
+                    (int(parts[2]),)).fetchone()
+                if seg and seg["locked"]:
+                    return self._json({"error": "段已锁定，只读"}, 409)
                 conn.execute("DELETE FROM actions WHERE id = ?",
                              (int(parts[2]),))
                 conn.commit()

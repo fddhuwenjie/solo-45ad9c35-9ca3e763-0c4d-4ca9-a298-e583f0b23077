@@ -230,10 +230,26 @@ function drawRuler() {
 /* ---------- 交互 ---------- */
 
 strip.addEventListener("click", async e => {
-  if (!data || data.segment.locked) return;
+  if (!data) return;
   const rect = strip.getBoundingClientRect();
   const x = (e.clientX - rect.left - MARGIN) / PX_PER_MM;
   if (x < 0) return;
+  if (tool === "anchor") {
+    // 设锚点：锁定段也允许，只续算锚点后方
+    let best = null, bd = Infinity;
+    for (const m of data.measurements) {
+      if (m.kind !== "sprocket") continue;
+      const d = Math.abs(m.x - x);
+      if (d < bd) { bd = d; best = m; }
+    }
+    if (best && bd < 10) {
+      await api("/api/segments/" + segId + "/anchor", "POST",
+                { measurement_id: best.id });
+      await loadSegment();
+    }
+    return;
+  }
+  if (data.segment.locked) return;
   const seq = tool === "sprocket"
     ? data.measurements.filter(m => m.kind === "sprocket").length + 1
     : 0;
@@ -241,6 +257,13 @@ strip.addEventListener("click", async e => {
             { seq, x, y: 0, kind: tool });
   await loadSegment();
 });
+
+$("clearAnchor").onclick = async () => {
+  if (!data) return;
+  await api("/api/segments/" + segId + "/anchor", "POST",
+            { measurement_id: null });
+  await loadSegment();
+};
 
 strip.addEventListener("contextmenu", async e => {
   e.preventDefault();
