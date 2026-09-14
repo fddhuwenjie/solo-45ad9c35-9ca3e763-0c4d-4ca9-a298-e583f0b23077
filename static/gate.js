@@ -58,19 +58,12 @@ function gateCompAt(fi) {
   return f || { shift: 0, angle: 0 };
 }
 
-/* ---------- 坐标映射 ---------- */
+/* ---------- 坐标映射 ----------
+   几何（旋转、角点）统一在 gate-geo.js，入参一律毫米，由纯函数内部
+   折像素；本文件不得把毫米先乘 PX_PER_* 再传进去（会二次缩放）。 */
 
 function gOrigin() {
   return { ox: gc.width / 2, oy: gc.height / 2 };
-}
-// 画格局部坐标（mm，x 沿片长，y 跨片宽向下为右）→ 画布
-function gMap(x, y, cx, cy, angDeg) {
-  const t = angDeg * Math.PI / 180;
-  const c = Math.cos(t), s = Math.sin(t);
-  return {
-    px: cx + (c * x + s * y) * G_PX_X,
-    py: cy + (-s * x + c * y) * G_PX_Y,
-  };
 }
 
 /* ---------- 绘制 ---------- */
@@ -116,16 +109,15 @@ function drawGate() {
   gctx.fillText("扫描窗", ox - winW / 2, oy - fw / 2 - 6);
 
   // 画格：按补偿后残差姿态摆放（实测中心 − 补偿，残差旋角）
+  // 半尺寸一律保持毫米，交由 gateFrameCorners 内部折像素
   const picW = (m.width || params.film_width);
-  const picAcross = picW * G_PX_Y / 2;
-  const picAlong = params.window_size * G_PX_X / 2;
-  const cy = oy + dx * G_PX_Y;
-  const corners = [
-    gMap(-picAlong, -picAcross, ox, cy, resAngle),
-    gMap(picAlong, -picAcross, ox, cy, resAngle),
-    gMap(picAlong, picAcross, ox, cy, resAngle),
-    gMap(-picAlong, picAcross, ox, cy, resAngle),
-  ];
+  const halfAcross = picW / 2;             // mm
+  const halfAlong = params.window_size / 2; // mm
+  const corners = gateFrameCorners({
+    ox, oy, halfAlong, halfAcross,
+    shiftDx: dx, angle: resAngle,
+    pxPerX: G_PX_X, pxPerY: G_PX_Y,
+  });
   gctx.strokeStyle = "#e8b13c";
   gctx.lineWidth = 1.6;
   gctx.beginPath();
@@ -146,7 +138,7 @@ function drawGate() {
   drawObservations(gFrame, oy, true);
 
   // 稳定关键帧（所有关键帧沿时间轴投影在顶部轨道，当前帧关键帧可拖）
-  drawKeyframeTrack(oy, picAlong, cy, resAngle);
+  drawKeyframeTrack(oy);
 
   // 信息与余量
   const f = data.gate.frames.find(x => x.frame === gFrame);
@@ -210,7 +202,7 @@ function drawOneObs(e, oy) {
   }
 }
 
-function drawKeyframeTrack(oy, picAlong, cy, resAngle) {
+function drawKeyframeTrack(oy) {
   // 关键帧轨道：画布顶部一排金色菱形；当前帧关键帧在画格上画出补偿把手
   const trackY = 18;
   const n = gateFrameCount();
@@ -236,19 +228,18 @@ function drawKeyframeTrack(oy, picAlong, cy, resAngle) {
     gctx.beginPath();
     gctx.arc(ox, kfcy, 6, 0, Math.PI * 2);
     gctx.fill();
-    const top = gMap(0, -params.film_width / 2 + comp.shift, ox, kfcy,
-                     comp.angle);
-    // 旋角把手：沿补偿角方向、画格上方
-    const t = comp.angle * Math.PI / 180;
-    const hx = ox + Math.sin(t) * picAlong * 0.9;
-    const hy = kfcy - Math.cos(t) * picAlong * 0.9;
+    // 旋角把手：沿补偿角方向、画格沿片长半幅上方；
+    // 与画格角点同式（gateRotateMap，毫米入参），所见即所得
+    const reach = params.window_size / 2 * 0.9;   // mm
+    const hp = gateRotateMap(0, -reach, ox, kfcy, comp.angle,
+                             G_PX_X, G_PX_Y);
     gctx.strokeStyle = "#7fd07f";
     gctx.beginPath();
-    gctx.moveTo(ox, kfcy); gctx.lineTo(hx, hy);
+    gctx.moveTo(ox, kfcy); gctx.lineTo(hp.px, hp.py);
     gctx.stroke();
     gctx.fillStyle = "#ffd766";
     gctx.beginPath();
-    gctx.arc(hx, hy, 6, 0, Math.PI * 2);
+    gctx.arc(hp.px, hp.py, 6, 0, Math.PI * 2);
     gctx.fill();
   }
 }
@@ -324,11 +315,12 @@ gc.addEventListener("mousedown", ev => {
   if (Math.hypot(px - ox, py - kfcy) < 10) {
     gDrag = { id: kf.id, mode: "shift" };
   } else {
-    const t = kf.angle * Math.PI / 180;
-    const along = params.window_size / 2;
-    const hx = ox + Math.sin(t) * along * G_PX_X * 0.9;
-    const hy = kfcy - Math.cos(t) * along * G_PX_X * 0.9;
-    if (Math.hypot(px - hx, py - hy) < 12) gDrag = { id: kf.id, mode: "angle" };
+    // 与绘制把手同一映射（gateRotateMap，毫米入参、内部折像素）
+    const reach = params.window_size / 2 * 0.9;
+    const hp = gateRotateMap(0, -reach, ox, kfcy, kf.angle,
+                             G_PX_X, G_PX_Y);
+    if (Math.hypot(px - hp.px, py - hp.py) < 12)
+      gDrag = { id: kf.id, mode: "angle" };
   }
 });
 

@@ -10,11 +10,13 @@
 ## 测试
 
     python3 -m unittest test_regression -v
+    node static/test_gate_geo.js        # 扫描窗画格角点几何（无服务/浏览器依赖）
 
 标准库回归测试（临时 SQLite + 本地 HTTP 服务，不触碰 measurements.db）：
 参数换版后首次设锚（v1 缓存 → v2 重算，frame 8/9/10 偏移 4.00/0.00/0.50）、
 同版本改锚、锁定段删除返回 409、托带跨脆裂边拒绝锁定、
-双边门位配对/插值/局部重算/五类校验拦截、
+双边门位配对/插值/局部重算/五类校验拦截、扫描窗角点像素位置
+（node 存在时由 Python 套件一并跑 `static/test_gate_geo.js`）、
 复算 JSON / 偏移 SVG / 稳定轨迹 SVG / 走带卡共用同一参数版本与双边观测。
 
 ## 使用流程

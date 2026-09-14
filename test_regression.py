@@ -8,6 +8,8 @@ HTTP 服务监听 127.0.0.1 的临时端口，用例结束即回收。
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -16,6 +18,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 import server
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PARAM_FIELDS = ("film_width", "nominal_pitch", "window_offset",
                 "window_size", "traction_limit", "safe_margin")
@@ -525,6 +529,23 @@ class TransportRegressionTest(unittest.TestCase):
         k = next(k for k in body["keyframes"] if k["frame_index"] == 2)
         self.assertAlmostEqual(k["shift"], 0.2, 6)
         self.assertAlmostEqual(k["angle"], 0.3, 6)
+
+    def test_gate_scan_window_corner_geometry(self):
+        """扫描窗预览角点：纯函数复现像素位置，默认数据须落在画布内。
+
+        前端 drawGate 曾把画格半尺寸先折像素、gMap 再折一次（重复缩放），
+        默认 16mm 数据四角全部出界。此处直接跑 Node 几何回归脚本，
+        环境无 node 时跳过。
+        """
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("未安装 node，跳过前端几何回归")
+        proc = subprocess.run(
+            [node, os.path.join(BASE_DIR, "static", "test_gate_geo.js")],
+            capture_output=True, text=True, cwd=BASE_DIR)
+        self.assertEqual(proc.returncode, 0,
+                         "门位角点几何回归失败：\n" + proc.stdout
+                         + proc.stderr)
 
 
 if __name__ == "__main__":
