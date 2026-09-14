@@ -34,6 +34,7 @@ async function loadParams() {
   $("p_woff").value = params.window_offset;
   $("p_wsize").value = params.window_size;
   $("p_trac").value = params.traction_limit;
+  $("p_safe").value = params.safe_margin;
   $("version").textContent = "参数版本 v" + params.version;
 }
 
@@ -58,8 +59,11 @@ async function loadSegment() {
   $("lockState").textContent = locked ? "已锁定 · 只读" : "未锁定";
   $("lockState").className = locked ? "locked" : "";
   $("svg").src = "/api/segments/" + segId + "/offset.svg?v=" + data.version;
+  $("gateSvg").src = "/api/segments/" + segId
+    + "/gate.svg?v=" + data.version + "&sig=" + data.gate.obs_sig;
   renderResults();
   drawAll();
+  drawGate();
 }
 
 function renderResults() {
@@ -295,6 +299,7 @@ $("saveParams").onclick = async () => {
     window_offset: +$("p_woff").value,
     window_size: +$("p_wsize").value,
     traction_limit: +$("p_trac").value,
+    safe_margin: +$("p_safe").value,
   });
   await loadParams();
   await loadSegment();

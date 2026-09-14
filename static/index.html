@@ -17,6 +17,7 @@
   <label>窗口偏移 mm <input id="p_woff" type="number" step="0.1"></label>
   <label>窗口尺寸 mm <input id="p_wsize" type="number" step="0.1"></label>
   <label>牵引上限 mm <input id="p_trac" type="number" step="0.1"></label>
+  <label>安全余量 mm <input id="p_safe" type="number" step="0.05"></label>
   <button id="saveParams">保存参数</button>
 </section>
 
@@ -42,6 +43,27 @@
 </section>
 
 <canvas id="strip" width="1100" height="240"></canvas>
+
+<section id="gateWS">
+  <h2>双边门位稳定工作区</h2>
+  <div id="gateBar">
+    <button id="g_prev">◀ 上一帧</button>
+    <span>帧 <input id="g_frame" type="number" min="0" value="0"> / <span id="g_count">0</span></span>
+    <button id="g_next">下一帧 ▶</button>
+    <span class="gsep">|</span>
+    <button data-gtool="Lsprocket" class="gtool active">左齿孔中心</button>
+    <button data-gtool="Ledge" class="gtool">左片边</button>
+    <button data-gtool="Rsprocket" class="gtool">右齿孔中心</button>
+    <button data-gtool="Redge" class="gtool">右片边</button>
+    <button data-gtool="gap" class="gtool">不可用缺口</button>
+    <button data-gtool="keyframe" class="gtool">稳定关键帧</button>
+    <span class="hint">点击画格放置观测；关键帧可拖动（上下=横移，顶部把手=旋角）；右键删除</span>
+  </div>
+  <canvas id="gateCanvas" width="1100" height="320"></canvas>
+  <div id="gateInfo"></div>
+  <div id="gateErr"></div>
+  <img id="gateSvg" alt="稳定轨迹">
+</section>
 
 <section id="timeline">
   <h2>时间尺</h2>
@@ -69,5 +91,6 @@
 </section>
 
 <script src="/static/app.js"></script>
+<script src="/static/gate.js"></script>
 </body>
 </html>
