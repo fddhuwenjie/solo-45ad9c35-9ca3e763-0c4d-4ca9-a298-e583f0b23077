@@ -22,7 +22,9 @@ import server
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PARAM_FIELDS = ("film_width", "nominal_pitch", "window_offset",
-                "window_size", "traction_limit", "safe_margin")
+                "window_size", "traction_limit", "safe_margin",
+                "lens_dof", "focus_near", "focus_far",
+                "motor_speed", "settle_time")
 
 
 class TransportRegressionTest(unittest.TestCase):
@@ -147,6 +149,46 @@ class TransportRegressionTest(unittest.TestCase):
     @staticmethod
     def by_frame(result):
         return {f["frame"]: f for f in result["frames"]}
+
+    # ---------- 焦面排程辅助 ----------
+
+    def add_height(self, seg, fi, pos, z, usable=True):
+        status, body = self.api(
+            "POST", "/api/segments/%d/heights" % seg,
+            {"frame_index": fi, "pos": pos, "z": z, "usable": usable})
+        self.assertEqual(status, 201, body)
+        return body["id"]
+
+    def cover_focus_frames(self, seg, n, zc=50.0, warp=0.0):
+        """n 帧五点测高：中央 zc，四角 ±warp（交替布包络）。"""
+        for fi in range(n):
+            self.add_height(seg, fi, "C", zc)
+            for pos, s in (("TL", -1), ("TR", 1), ("BL", 1), ("BR", -1)):
+                self.add_height(seg, fi, pos, zc + s * warp)
+
+    def add_focus_anchor(self, seg, fi, focus=None):
+        body = {"frame_index": fi}
+        if focus is not None:
+            body["focus"] = focus
+        status, out = self.api(
+            "POST", "/api/segments/%d/focus_anchors" % seg, body)
+        self.assertEqual(status, 201, out)
+        return out["id"]
+
+    def set_focus_strategy(self, seg, strat):
+        status, out = self.api(
+            "POST", "/api/segments/%d/focus_strategy" % seg,
+            {"strategy": strat})
+        self.assertEqual(status, 200, out)
+        return out
+
+    def focus_result(self, seg):
+        _, result = self.api("GET", "/api/segments/%d" % seg)
+        return result["focus"]
+
+    @staticmethod
+    def focus_row(focus, fi):
+        return next(r for r in focus["frames"] if r["frame"] == fi)
 
     # ---------- 用例 ----------
 
@@ -546,6 +588,325 @@ class TransportRegressionTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0,
                          "门位角点几何回归失败：\n" + proc.stdout
                          + proc.stderr)
+
+    # ---------- 焦面排程 ----------
+
+    def _focus_segment(self, name, n=12, pitch=7.62, **kw):
+        seg = self.create_segment(name)
+        self.add_sprockets(seg, n + 1, pitch)
+        return seg
+
+    def test_focus_envelope_recommended_coverage(self):
+        """翘曲包络按帧拟合：推荐策略咬中点，景深窗算清晰覆盖比例。"""
+        seg = self._focus_segment("焦面包络")
+        # 帧 0 包络厚 0.1（景深 0.25 全覆盖），帧 11 包络厚 0.6（只罩中央）
+        for fi in range(12):
+            w = 0.05 + 0.25 * fi / 11
+            self.add_height(seg, fi, "C", 50.0)
+            for pos, s in (("TL", -1), ("TR", 1), ("BL", 1), ("BR", -1)):
+                self.add_height(seg, fi, pos, 50.0 + s * w)
+        focus = self.focus_result(seg)
+        r0 = self.focus_row(focus, 0)
+        r11 = self.focus_row(focus, 11)
+        self.assertAlmostEqual(r0["z_near"], 49.95, places=6)
+        self.assertAlmostEqual(r0["z_far"], 50.05, places=6)
+        self.assertAlmostEqual(r0["target"], 50.0, places=6)
+        self.assertEqual(r0["coverage"], 1.0)
+        # 末帧 ±0.3 角点距焦位 0.3 > 景深半窗 0.125，只有中央在窗内
+        self.assertAlmostEqual(r11["coverage"], 0.2, places=6)
+        self.assertTrue(all(r["settled"] for r in focus["frames"]))
+
+    def test_focus_three_strategies(self):
+        """恒定 / 推荐 / 人工三策略：恒焦全段一个焦位，人工锚间线性插值。"""
+        seg = self._focus_segment("焦面三策略")
+        self.cover_focus_frames(seg, 12, zc=50.0, warp=0.05)
+
+        # 恒定：首锚 49.9 全段不变
+        self.set_focus_strategy(seg, "constant")
+        self.add_focus_anchor(seg, 2, focus=49.9)
+        focus = self.focus_result(seg)
+        self.assertTrue(all(abs(r["focus"] - 49.9) < 1e-9
+                            for r in focus["frames"]))
+
+        # 清锚换人工：0→11 由 50.0 线性到 50.2
+        _, result = self.api("GET", "/api/segments/%d" % seg)
+        for a in result["focus_anchors"]:
+            self.assertEqual(
+                self.api("DELETE", "/api/focus_anchors/%d" % a["id"])[0], 200)
+        self.set_focus_strategy(seg, "manual")
+        self.add_focus_anchor(seg, 0, focus=50.0)
+        self.add_focus_anchor(seg, 11, focus=50.2)
+        focus = self.focus_result(seg)
+        self.assertAlmostEqual(self.focus_row(focus, 5)["focus"],
+                               50.0 + 0.2 * 5 / 11, places=6)
+        self.assertAlmostEqual(self.focus_row(focus, 0)["focus"], 50.0, 6)
+        self.assertAlmostEqual(self.focus_row(focus, 11)["focus"], 50.2, 6)
+        # 首锚默认值咬住该帧包络中点
+        seg2 = self._focus_segment("默认锚")
+        self.cover_focus_frames(seg2, 8, zc=51.0, warp=0.1)
+        aid = self.add_focus_anchor(seg2, 3)   # 不给 focus
+        _, res = self.api("GET", "/api/segments/%d" % seg2)
+        a = next(x for x in res["focus_anchors"] if x["id"] == aid)
+        self.assertAlmostEqual(a["focus"], 51.0, places=6)
+
+    def test_focus_anchor_tweak_only_recomputes_neighbor_zones(self):
+        """编辑焦点锚点：只更新夹在相邻锚点间的区间；再查零重算。"""
+        seg = self._focus_segment("焦面局部重算")
+        self.cover_focus_frames(seg, 12, warp=0.02)
+        self.set_focus_strategy(seg, "manual")
+        self.add_focus_anchor(seg, 0, focus=50.0)
+        self.add_focus_anchor(seg, 5, focus=50.1)
+        self.add_focus_anchor(seg, 11, focus=50.2)
+        # 插锚后相邻两区间重算
+        status, body = self.api(
+            "POST", "/api/segments/%d/focus_anchors" % seg,
+            {"frame_index": 8, "focus": 50.15})
+        self.assertEqual(status, 201)
+        self.assertEqual(sorted(body["focus"]["recomputed_zones"]),
+                         ["manual:zone:5-8", "manual:zone:8-11"])
+        # 再查零重算
+        self.assertEqual(self.focus_result(seg)["recomputed_zones"], [])
+        # 拖动 frame 5：只 0-5 与 5-8
+        _, res = self.api("GET", "/api/segments/%d" % seg)
+        k5 = next(a["id"] for a in res["focus_anchors"]
+                  if a["frame_index"] == 5)
+        status, body = self.api(
+            "POST", "/api/segments/%d/focus_anchors/%d" % (seg, k5),
+            {"focus": 50.08})
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(body["recomputed_zones"]),
+                         ["manual:zone:0-5", "manual:zone:5-8"])
+        self.assertEqual(self.focus_result(seg)["recomputed_zones"], [])
+
+    def test_focus_strategy_switch_uses_same_envelope(self):
+        """切换策略不串味：缓存只存包络，目标焦位按新策略首帧即正确。"""
+        seg = self._focus_segment("焦面切策略")
+        self.cover_focus_frames(seg, 12, warp=0.02)
+        self.set_focus_strategy(seg, "constant")
+        self.add_focus_anchor(seg, 3, focus=49.5)
+        focus = self.focus_result(seg)
+        self.assertTrue(all(r["focus"] == 49.5 for r in focus["frames"]))
+        # 切回推荐：目标应回到各帧包络中点 50.0，而不是沿用 49.5
+        self.set_focus_strategy(seg, "recommended")
+        focus = self.focus_result(seg)
+        self.assertTrue(all(abs(r["target"] - 50.0) < 1e-9
+                            for r in focus["frames"]))
+        # h_sig 保持不变
+        self.assertTrue(focus["h_sig"])
+
+    def test_focus_ambiguous_height_locates_first_frame(self):
+        """测高点归帧歧义：同帧同点位多条可用，定位首帧并拒绝锁定。"""
+        seg = self._focus_segment("焦面归帧歧义")
+        self.cover_focus_frames(seg, 8)
+        self.add_height(seg, 3, "C", 50.11)   # frame 3 中央第二条
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("帧 3" in e and "归帧有歧义" in e
+                            for e in body["errors"]))
+        # 标缺一条后多解消除，可锁定
+        _, res = self.api("GET", "/api/segments/%d" % seg)
+        dup = [h for h in res["height_observations"]
+               if h["frame_index"] == 3 and h["pos"] == "C"]
+        status, _ = self.api(
+            "POST", "/api/segments/%d/heights/%d" % (seg, dup[-1]["id"]),
+            {"usable": False})
+        self.assertEqual(status, 200)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_splice_baseline_break(self):
+        """接片基准断裂：缺 SB/SA 或前后物距跳变超景深，定位接片帧。"""
+        # 条带圈记了接片但无 SB/SA
+        seg = self._focus_segment("焦面接片缺基准")
+        self.cover_focus_frames(seg, 12)
+        self.add_measurement(seg, 0, 5 * 7.62, kind="splice")
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("帧 5" in e and "接片基准断裂" in e
+                            for e in body["errors"]))
+        # 补上 SB/SA 但跳变 1.0mm > 景深 0.25
+        self.add_height(seg, 5, "SB", 50.0)
+        self.add_height(seg, 6, "SA", 51.0)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("物距跳变" in e for e in body["errors"]))
+        # 加大景深到 1.2 后跳变被景深吞掉，放行
+        self.set_params(lens_dof=1.2)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_data_gap_too_long(self):
+        """数据空档：连续无直接测高超过 6 帧，定位空档首帧。"""
+        seg = self._focus_segment("焦面空档")
+        for fi in (0, 1, 10, 11):
+            self.add_height(seg, fi, "C", 50.0)
+            for pos in ("TL", "TR", "BL", "BR"):
+                self.add_height(seg, fi, pos, 50.0)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("数据空档" in e and "帧 2" in e
+                            for e in body["errors"]))
+        # 对照：空档 6 帧（==上限）不报
+        seg2 = self._focus_segment("焦面空档达标")
+        for fi in list(range(3)) + list(range(9, 12)):
+            self.add_height(seg2, fi, "C", 50.0)
+            for pos in ("TL", "TR", "BL", "BR"):
+                self.add_height(seg2, fi, pos, 50.0)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg2, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_coverage_below_threshold_blocks_lock(self):
+        """焦域覆盖不足：清晰覆盖低于 80% 定位首帧；加大景深后放行。"""
+        seg = self._focus_segment("焦域覆盖")
+        for fi in range(12):
+            w = 0.05 + 0.25 * fi / 11
+            self.add_height(seg, fi, "C", 50.0)
+            for pos, s in (("TL", -1), ("TR", 1), ("BL", 1), ("BR", -1)):
+                self.add_height(seg, fi, pos, 50.0 + s * w)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("焦域覆盖不足" in e for e in body["errors"]))
+        self.set_params(lens_dof=0.7)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_motor_cannot_settle(self):
+        """机构来不及稳定：相邻帧焦位需求超出速度×(dt−静定)；降速解救。"""
+        seg = self._focus_segment("焦面来不及")
+        for fi in range(12):
+            zc = 50.0 if fi < 6 else 55.0
+            for pos in ("C", "TL", "TR", "BL", "BR"):
+                self.add_height(seg, fi, pos, zc)
+        # 默认 8mm/s、静定 0.02s：帧间隔 0.0417s 最多走 0.17mm，5mm 必失败
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("来不及稳定" in e for e in body["errors"]))
+        # 帧 5 降速 20 倍：dt≈0.833s，电机可走 8×0.813≈6.5mm > 5mm
+        status, _ = self.api("POST", "/api/segments/%d/actions" % seg,
+                             {"frame_index": 5, "type": "slow", "factor": 20.0})
+        self.assertEqual(status, 201)
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_position_out_of_range(self):
+        """所需焦位超出调焦范围：首帧拦截。"""
+        seg = self._focus_segment("焦面超程")
+        self.cover_focus_frames(seg, 8, zc=80.0)   # 默认范围 40–60
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("超出调焦范围" in e for e in body["errors"]))
+
+    def test_focus_manual_without_anchor_rejected(self):
+        """人工策略无锚点拒绝锁定；推荐/恒定不受此限。"""
+        seg = self._focus_segment("人工无锚")
+        self.cover_focus_frames(seg, 8)
+        self.set_focus_strategy(seg, "manual")
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 422)
+        self.assertTrue(any("人工策略" in e and "焦点锚点" in e
+                            for e in body["errors"]))
+        self.set_focus_strategy(seg, "recommended")
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+
+    def test_focus_three_views_share_height_draft_and_strategy(self):
+        """焦域热图、重演 JSON、走带卡固定同一测高稿指纹与策略版本。"""
+        seg = self._focus_segment("焦面三图同源")
+        self.cover_focus_frames(seg, 8, zc=50.0, warp=0.05)
+        self.set_focus_strategy(seg, "manual")
+        self.add_focus_anchor(seg, 0, focus=50.0)
+        self.add_focus_anchor(seg, 7, focus=50.05)
+        # v1 锁定缓存，再升 v2
+        self.assertEqual(
+            self.api("POST", "/api/segments/%d/lock" % seg, {})[0], 200)
+        self.set_params(lens_dof=0.4)
+
+        _, js = self.api("GET", "/api/segments/%d" % seg)
+        hsig = js["focus"]["h_sig"]
+        self.assertEqual(js["version"], 2)
+        self.assertEqual(js["focus"]["strategy"], "manual")
+
+        status, svg, ctype = self.get_raw(
+            "/api/segments/%d/focus.svg" % seg)
+        self.assertEqual(status, 200)
+        self.assertEqual(ctype, "image/svg+xml")
+        self.assertIn("参数版本 v2", svg)
+        self.assertIn(hsig, svg)
+
+        _, replay = self.api(
+            "GET", "/api/segments/%d/focus_replay" % seg)
+        self.assertEqual(replay["h_sig"], hsig)
+        self.assertEqual(replay["version"], 2)
+        self.assertEqual(replay["strategy"], "manual")
+        self.assertEqual(len(replay["frames"]),
+                         len(js["focus"]["frames"]))
+        self.assertEqual(replay["lens"]["dof"], 0.4)
+
+        _, card = self.api("GET",
+                           "/api/segments/%d/transport_card" % seg)
+        self.assertEqual(card["h_sig"], hsig)
+        self.assertEqual(card["focus_strategy"], "manual")
+        self.assertEqual(card["version"], 2)
+        self.assertEqual(card["focus"]["anchors"], 2)
+
+    def test_focus_height_change_invalidates_cache(self):
+        """测高稿增删改：h_sig 变化，区间缓存失效重算。"""
+        seg = self._focus_segment("焦面测高改版")
+        self.cover_focus_frames(seg, 8, warp=0.02)
+        focus = self.focus_result(seg)
+        sig0 = focus["h_sig"]
+        self.assertEqual(focus["recomputed_zones"], [])
+        # 多一条中央测高 → 均值变化、h_sig 变；POST 响应带回重算区间
+        status, body = self.api(
+            "POST", "/api/segments/%d/heights" % seg,
+            {"frame_index": 4, "pos": "C", "z": 50.02})
+        self.assertEqual(status, 201)
+        self.assertNotEqual(body["focus"]["h_sig"], sig0)
+        self.assertTrue(body["focus"]["recomputed_zones"])
+        # 再取已命中新缓存（零重算），指纹保持
+        focus = self.focus_result(seg)
+        self.assertNotEqual(focus["h_sig"], sig0)
+        self.assertEqual(focus["recomputed_zones"], [])
+
+    def test_focus_locked_region_readonly(self):
+        """锁定区：测高点与焦点锚点写入/删除全部 409。"""
+        seg = self._focus_segment("焦面锁定只读")
+        self.cover_focus_frames(seg, 6)
+        aid = self.add_focus_anchor(seg, 0, focus=50.0)
+        self.assertEqual(
+            self.api("POST", "/api/segments/%d/lock" % seg, {})[0], 200)
+        status, _ = self.api(
+            "POST", "/api/segments/%d/heights" % seg,
+            {"frame_index": 1, "pos": "C", "z": 50.0})
+        self.assertEqual(status, 409)
+        status, _ = self.api(
+            "POST", "/api/segments/%d/focus_anchors" % seg,
+            {"frame_index": 2, "focus": 50.0})
+        self.assertEqual(status, 409)
+        status, _ = self.api(
+            "POST", "/api/segments/%d/focus_anchors/%d" % (seg, aid),
+            {"focus": 51.0})
+        self.assertEqual(status, 409)
+        _, res = self.api("GET", "/api/segments/%d" % seg)
+        hid = res["height_observations"][0]["id"]
+        self.assertEqual(self.api("DELETE", "/api/heights/%d" % hid)[0], 409)
+        self.assertEqual(
+            self.api("DELETE", "/api/focus_anchors/%d" % aid)[0], 409)
+        # 策略切换也不允许（会改变锁定结果）
+        status, _ = self.api(
+            "POST", "/api/segments/%d/focus_strategy" % seg,
+            {"strategy": "constant"})
+        self.assertEqual(status, 409)
+
+    def test_focus_empty_segment_not_constrained(self):
+        """无测高稿：焦面校验整项跳过，旧段锁定行为不变。"""
+        seg = self._focus_segment("无测高旧段")
+        status, body = self.api("POST", "/api/segments/%d/lock" % seg, {})
+        self.assertEqual(status, 200, body)
+        _, res = self.api("GET", "/api/segments/%d" % seg)
+        self.assertEqual(res["focus_errors"], [])
+        import compute as _compute
+        self.assertEqual(res["focus"]["h_sig"], _compute.height_signature([]))
 
 
 if __name__ == "__main__":

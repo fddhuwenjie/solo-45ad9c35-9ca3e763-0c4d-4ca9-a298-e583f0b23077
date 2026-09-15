@@ -7,6 +7,7 @@ JSON API、偏移 SVG、走带卡共用这里的函数，保证同一版参数�
 关键帧之间线性插值出连续门位补偿，并核算扫描窗对画面的安全裁切余量。
 """
 
+import copy
 import hashlib
 import math
 
@@ -509,6 +510,406 @@ def validate_gate(params, edges, keyframes, gate):
             errors.append("门位：帧 %d 扫描窗侵入画面（最小余量 %.3fmm），"
                           "横移 %.2f / 旋角 %.2f° 未补偿到位"
                           % (f["frame"], f["min"], f["shift"], f["angle"]))
+            break
+
+    return errors
+
+
+# ========== 焦面排程 ==========
+#
+# 受潮胶片横向拱起后，同一画格中央与四角落在不同物距上；门位补偿只能稳住
+# 构图，局部仍失焦。修复师在 Canvas 画格上记录五个标准点位的测高（中央 C、
+# 四角 TL/TR/BL/BR）以及接片前后的基准点（SB/SA），后台对每个点位沿时间
+# 线性插值，拟合出每帧的翘曲包络 [z_near, z_far]，再按三种策略排出逐帧
+# 焦位与电机速度：
+#
+#   constant    恒定：全段一个焦位（首锚焦位；无锚取包络总中值）
+#   recommended 推荐：每帧咬住包络中点，电机按时间尺可达即跟随
+#   manual      人工：焦点锚点之间线性插值，锚点外夹取端点值
+#
+# 景深窗 [focus−dof/2, focus+dof/2] 覆盖到的测点比例即清晰覆盖比例。
+# 电机可行性：相邻曝光帧之间 |Δfocus| ≤ speed·(dt − settle)；hold/skip/
+# 降速都在帧时间尺 dt 里，天然给电机更多时间。
+#
+# 与门位一样按区间缓存：人工策略夹在相邻锚点之间，改一个锚点只重算两侧
+# 区间；恒定/推荐为整段单区间。测高稿指纹（h_sig）、策略、镜头参数版本
+# 三者一致才复用。焦域热图、重演 JSON、走带卡固定同一 h_sig 与策略版本。
+
+FOCUS_CANON = ("C", "TL", "TR", "BL", "BR")
+FOCUS_SPLICE_PRE = "SB"          # 接片前基准
+FOCUS_SPLICE_POST = "SA"         # 接片后基准
+FOCUS_STRATEGIES = ("constant", "recommended", "manual")
+FOCUS_STRATEGY_CN = {
+    "constant": "恒定", "recommended": "推荐", "manual": "人工"}
+
+MAX_HEIGHT_GAP_FRAMES = 6        # 无测高帧连续跨度上限
+MIN_FOCUS_COVERAGE = 0.80        # 清晰覆盖比例下限
+
+
+def _usable_heights(heights):
+    return [h for h in heights if h.get("usable", 1)
+            and h.get("z") is not None]
+
+
+def height_signature(heights):
+    """测高稿指纹：测高增删改（含标缺）即失效全部焦面区间缓存。"""
+    h = hashlib.sha1()
+    for e in sorted(heights, key=lambda x: x["id"]):
+        h.update(("%(id)d %(frame_index)d %(pos)s %(z)s %(usable)d" % {
+            "id": e["id"], "frame_index": e["frame_index"],
+            "pos": e["pos"], "z": e.get("z"),
+            "usable": e.get("usable", 1)}).encode())
+    return h.hexdigest()[:16]
+
+
+def _height_at(usable, fi, pos):
+    """某个点位在 fi 帧的物距：同帧多点位取均值（多解另由校验拦截），
+    帧间线性插值，片段外夹取端点值；该点位从无观测返回 None。"""
+    pts = sorted((h for h in usable if h["frame_index"] is not None
+                  and h["pos"] == pos), key=lambda h: h["frame_index"])
+    if not pts:
+        return None
+    here = [h["z"] for h in pts if h["frame_index"] == fi]
+    if here:
+        return sum(here) / len(here)
+    if fi <= pts[0]["frame_index"]:
+        return pts[0]["z"]
+    if fi >= pts[-1]["frame_index"]:
+        return pts[-1]["z"]
+    for a, b in zip(pts, pts[1:]):
+        if a["frame_index"] < fi < b["frame_index"]:
+            t = (fi - a["frame_index"]) / (b["frame_index"] - a["frame_index"])
+            return a["z"] + (b["z"] - a["z"]) * t
+    return None
+
+
+def focus_envelope(params, usable, fi):
+    """fi 帧翘曲包络：返回 (near, far, by_pos)，无任何标准点位时为 None。"""
+    by_pos = {p: _height_at(usable, fi, p) for p in FOCUS_CANON}
+    vals = [v for v in by_pos.values() if v is not None]
+    if not vals:
+        return None
+    return min(vals), max(vals), by_pos
+
+
+def _focus_zone_keys(anchors, n_frames):
+    """人工策略按锚点切区间（沿用门位区间定义）；无锚/恒定/推荐为整段。"""
+    kfs = sorted(anchors, key=lambda k: k["frame_index"])
+    return _zones(kfs, max(n_frames, 1))
+
+
+def _anchor_signature(a):
+    return "%d:%.5f" % (a["frame_index"], a["focus"])
+
+
+def default_focus_anchor(params, usable, fi):
+    """新焦点锚点默认咬住该帧包络中点（推荐起点）；无包络取焦程中点。"""
+    env = focus_envelope(params, usable, fi)
+    if env:
+        focus = (env[0] + env[1]) / 2.0
+    else:
+        focus = (params["focus_near"] + params["focus_far"]) / 2.0
+    lo, hi = sorted((params["focus_near"], params["focus_far"]))
+    return {"frame_index": fi, "focus": min(hi, max(lo, focus))}
+
+
+def _frame_t(frames, fi):
+    f = next((x for x in frames if x["frame"] == fi), None)
+    return f["tc"] if f else fi / FPS
+
+
+def build_focus(params, heights, anchors, frames, strategy, cache=None,
+                n_frames=None):
+    """焦面排程主函数。返回逐帧焦位/速度/覆盖率与区间缓存（同 build_gate）。
+
+    每行：frame / z_near / z_far / mid / target / focus / speed /
+          dt / settled（机构是否来得及稳定）/ in_range / coverage /
+          skipped / strategy。
+    """
+    if strategy not in FOCUS_STRATEGIES:
+        strategy = "constant"
+    usable = _usable_heights(heights)
+    h_sig = height_signature(heights)
+    version = params["version"]
+    dof = params["lens_dof"]
+    speed_max = params["motor_speed"]
+    settle = params["settle_time"]
+    f_lo, f_hi = sorted((params["focus_near"], params["focus_far"]))
+    if n_frames is None:
+        n_frames = len(frames)
+    n_frames = max(n_frames, 1)
+
+    # 缓存命中条件：镜头参数版本、测高稿指纹、区间端点签名一致即复用包络。
+    # 缓存体只存与策略无关的翘曲包络；目标焦位/速度/覆盖每次按当前策略
+    # 重算，切换策略后首帧即得到正确目标（不把目标带进缓存串味）。
+    cached = {}
+    if (isinstance(cache, dict) and cache.get("version") == version
+            and cache.get("h_sig") == h_sig):
+        cached = {z["key"]: z for z in cache.get("zones", [])}
+
+    if strategy == "manual":
+        raw_zones = _focus_zone_keys(anchors, n_frames)
+    else:
+        raw_zones = [("zone:%s:all" % strategy, 0, n_frames - 1, None, None)]
+    # 区间键带策略前缀，避免人工区间与恒焦/推荐整段键在跨策略复用缓存时撞名。
+    # 元组约定与门位 _zones 一致：head=(first,None) 夹首锚，tail=(last,None)
+    # 夹尾锚，中间 (a,b) 线性插值。
+    zones = [("%s:%s" % (strategy, key), f0, f1, ka, kb)
+             for key, f0, f1, ka, kb in raw_zones]
+    active = {z[0] for z in zones}
+    for stale in [k for k in cached if k not in active]:
+        del cached[stale]
+
+    recomputed, rowmap = [], {}
+
+    def envelope_rows(f0, f1):
+        rows = []
+        for fi in range(f0, f1 + 1):
+            env = focus_envelope(params, usable, fi)
+            if env is None:
+                rows.append({"frame": fi, "z_near": None, "z_far": None,
+                             "mid": None, "by_pos": None})
+            else:
+                rows.append({"frame": fi, "z_near": env[0], "z_far": env[1],
+                             "mid": (env[0] + env[1]) / 2.0,
+                             "by_pos": env[2]})
+        return rows
+
+    # 第一遍：区间包络（只在这里读写缓存），顺便汇总全段中值
+    mids = []
+    for key, f0, f1, k0, k1 in zones:
+        sig0 = _anchor_signature(k0) if k0 else None
+        sig1 = _anchor_signature(k1) if k1 else None
+        zc = cached.get(key)
+        if zc is None or zc.get("sig0") != sig0 or zc.get("sig1") != sig1:
+            recomputed.append(key)
+            zc = {"key": key, "sig0": sig0, "sig1": sig1,
+                  "rows": envelope_rows(f0, f1)}
+            cached[key] = zc
+        mids.extend(r["mid"] for r in zc["rows"] if r["mid"] is not None)
+
+    # 恒焦值：首锚焦位；无锚取包络总中值
+    if strategy == "constant":
+        if anchors:
+            const_focus = sorted(anchors,
+                                 key=lambda a: a["frame_index"])[0]["focus"]
+        elif mids:
+            const_focus = (min(mids) + max(mids)) / 2.0
+        else:
+            const_focus = (f_lo + f_hi) / 2.0
+
+    # 第二遍：按当前策略生成目标焦位（输出行独立于缓存，不污染包络缓存）。
+    # 旧缓存行里可能残留上一轮的 target/focus 字段，先裁回纯包络四字段。
+    envelope_keys = ("frame", "z_near", "z_far", "mid", "by_pos")
+    for key, f0, f1, k0, k1 in zones:
+        for src in cached[key]["rows"]:
+            r = {k: copy.deepcopy(src.get(k)) for k in envelope_keys}
+            fi = r["frame"]
+            if strategy == "recommended":
+                target = r["mid"]
+            elif strategy == "constant":
+                target = const_focus
+            else:  # manual：约定同门位 _zones——head 元组 (first,None)
+                # 夹首锚；tail (last,None) 夹尾锚；中间 (a,b) 线性插值；
+                # 无任何锚点时退化为调焦范围中值（校验会提示人工策略需加锚）
+                if k0 is None and k1 is None:
+                    target = (f_lo + f_hi) / 2.0
+                elif k1 is None:
+                    target = k0["focus"]
+                else:
+                    t = 0.0 if k1["frame_index"] == k0["frame_index"] else \
+                        (fi - k0["frame_index"]) / (k1["frame_index"]
+                                                    - k0["frame_index"])
+                    target = k0["focus"] + (k1["focus"] - k0["focus"]) * t
+            r["target"] = target
+            r["strategy"] = strategy
+            rowmap[fi] = r
+
+    # 电机排程：沿校正时间尺求速度与可达性，再按实际下达焦位算清晰覆盖。
+    # 目标先不裁剪，超焦程由校验按首帧拦截（焦位由机构限位夹住，
+    # 覆盖仍按夹住后的焦位核算）。无包络帧不产生焦位需求，其时间也
+    # 可供电机继续移动，因此用上一个有目标帧作为移动起点。
+    prev_fi = None
+    prev_target = None
+    for fi in sorted(rowmap):
+        r = rowmap[fi]
+        t = _frame_t(frames, fi)
+        skipped = any(f.get("skipped") for f in frames if f["frame"] == fi)
+        r["skipped"] = skipped
+        if prev_fi is None:
+            dt, move_need = None, 0.0
+        else:
+            dt = max(0.0, t - _frame_t(frames, prev_fi))
+            move_need = (abs(r["target"] - prev_target)
+                         if r["target"] is not None and prev_target is not None
+                         else 0.0)
+        r["dt"] = dt
+        r["in_range"] = (r["target"] is None
+                         or (f_lo - 1e-9 <= r["target"] <= f_hi + 1e-9))
+        r["focus"] = (min(f_hi, max(f_lo, r["target"]))
+                      if r["target"] is not None else None)
+        if dt is None:
+            r["speed"] = 0.0
+            r["settled"] = True
+        else:
+            r["speed"] = move_need / dt if dt > 1e-12 else float("inf")
+            r["settled"] = (dt >= settle
+                            and move_need <= speed_max * max(0.0, dt - settle)
+                            + 1e-9)
+        # 清晰覆盖：景深窗包住的标准测点比例（空齿帧不曝光、不参与）
+        if r["by_pos"] and r["focus"] is not None and not skipped:
+            vals = [v for v in r["by_pos"].values() if v is not None]
+            hit = sum(1 for z in vals
+                      if abs(z - r["focus"]) <= dof / 2.0 + 1e-9)
+            r["coverage"] = hit / len(vals)
+        else:
+            r["coverage"] = None
+        prev_fi = fi
+        if r["target"] is not None:
+            prev_target = r["target"]
+
+    out = [rowmap[i] for i in sorted(rowmap)]
+    new_cache = {"version": version, "h_sig": h_sig, "strategy": strategy,
+                 "zones": [cached[k] for k in sorted(cached)]}
+    # 归帧歧义：同帧同标准点位多条可用测高
+    ambiguous = sorted({h["frame_index"] for h in usable
+                        if h["pos"] in FOCUS_CANON
+                        and sum(1 for g in usable
+                                if g["frame_index"] == h["frame_index"]
+                                and g["pos"] == h["pos"]) > 1})
+    return {
+        "version": version,
+        "h_sig": h_sig,
+        "strategy": strategy,
+        "anchors": [dict(a) for a in sorted(anchors,
+                                            key=lambda a: a["frame_index"])],
+        "frames": out,
+        "recomputed_zones": recomputed,
+        "ambiguous_frames": ambiguous,
+        "cache": new_cache,
+    }
+
+
+def validate_focus(params, heights, anchors, frames, focus,
+                   splice_frames=(), n_frames=None):
+    """焦面排程锁定校验。返回错误列表（空列表放行），每条带首帧定位。
+
+    五类拦截（均停在首个受影响画格）：
+    测高归帧歧义 / 接片基准断裂 / 数据空档过长 / 焦域覆盖不足 /
+    机构来不及稳定（含焦位超出调焦范围）。
+    无测高稿时整项跳过（与门位无观测一致），不对旧段产生新约束。
+    splice_frames：条带圈记的接片所在帧号（接片基准也必须落在这些帧上）。
+    """
+    usable = _usable_heights(heights)
+    canon = [h for h in usable if h["pos"] in FOCUS_CANON]
+    errors = []
+    if not canon and not any(h.get("usable", 1) for h in heights):
+        return errors
+    if n_frames is None:
+        n_frames = len(frames)
+    n_frames = max(n_frames, 1)
+
+    # 0. 人工策略必须先布焦点锚点（否则区间无端点可插值）
+    if focus["strategy"] == "manual" and not anchors:
+        errors.append("焦面：人工策略未布置任何焦点锚点，请在时间轴上"
+                      "插入锚点或改用推荐/恒定策略")
+
+    # 1. 测高点归帧歧义：同帧同标准点位多条可用
+    if focus["ambiguous_frames"]:
+        fi = focus["ambiguous_frames"][0]
+        errors.append("焦面：帧 %d 同一点位存在多条可用测高，归帧有歧义，"
+                      "请删除或标缺多余测点" % fi)
+
+    # 2. 接片基准断裂：接片两侧都要有基准（SB 接片前 / SA 接片后），
+    #    且前后物距跳变不得超过一个景深（跳得过大说明两本片子物距基准
+    #    对不上，不能跨接片沿用同一条焦面轨迹）。测高稿上 SB/SA 直接成对，
+    #    条带圈记的接片（splice_frames 帧号）则要求该帧有 SB、次帧有 SA。
+    dof = params["lens_dof"]
+    pre_by_fi = {}
+    post_by_fi = {}
+    for h in usable:
+        if h["pos"] == FOCUS_SPLICE_PRE:
+            pre_by_fi.setdefault(h["frame_index"], []).append(h["z"])
+        elif h["pos"] == FOCUS_SPLICE_POST:
+            post_by_fi.setdefault(h["frame_index"], []).append(h["z"])
+
+    def require_pair(sf):
+        """sf 帧为接片：SB 在 sf、SA 在 sf 或 sf+1。返回错误串或 None。"""
+        pre = pre_by_fi.get(sf)
+        post = post_by_fi.get(sf)
+        if post is None:
+            post = post_by_fi.get(sf + 1)
+        if not pre:
+            return ("焦面：帧 %d 接片前缺基准点 SB，接片基准断裂，"
+                    "不能跨接片沿用焦位" % sf)
+        if not post:
+            return ("焦面：帧 %d 接片后缺基准点 SA，接片基准断裂，"
+                    "不能跨接片沿用焦位" % sf)
+        zpre, zpost = sum(pre) / len(pre), sum(post) / len(post)
+        if abs(zpost - zpre) > dof + 1e-9:
+            return ("焦面：帧 %d 接片前后物距跳变 %.3fmm 超过景深 %.2fmm，"
+                    "接片基准断裂" % (sf, abs(zpost - zpre), dof))
+        return None
+
+    pairs = set(pre_by_fi) | set(splice_frames)
+    for sf in sorted(pairs):
+        msg = require_pair(int(sf))
+        if msg:
+            errors.append(msg)
+            break
+
+    # 3. 数据空档过长：有测高覆盖的帧范围内，连续无直接标准测高的帧数超
+    #    上限（注意不能看插值包络——空档恰恰会被插值填上）
+    observed = {h["frame_index"] for h in canon}
+    if observed:
+        lo, hi = min(observed), max(observed)
+        run, start = 0, None
+        for fi in range(lo, hi + 1):
+            if fi not in observed:
+                if run == 0:
+                    start = fi
+                run += 1
+                if run > MAX_HEIGHT_GAP_FRAMES:
+                    errors.append("焦面：帧 %d 起连续 %d 帧无测高，数据空档"
+                                  "超过上限 %d 帧"
+                                  % (start, run, MAX_HEIGHT_GAP_FRAMES))
+                    break
+            else:
+                run = 0
+
+    # 4. 焦域覆盖不足：曝光帧清晰覆盖比例低于下限
+    for r in focus["frames"]:
+        if r["coverage"] is not None and r["coverage"] < MIN_FOCUS_COVERAGE:
+            errors.append("焦面：帧 %d 清晰覆盖比例 %.0f%% 低于下限 %.0f%%，"
+                          "焦域覆盖不足（景深 %.2fmm 包不住翘曲包络 "
+                          "%.3f–%.3fmm）"
+                          % (r["frame"], 100 * r["coverage"],
+                             100 * MIN_FOCUS_COVERAGE, dof,
+                             r["z_near"], r["z_far"]))
+            break
+
+    # 5. 机构来不及稳定：焦位超出调焦范围，或相邻曝光帧间速度/静定不满足
+    for r in focus["frames"]:
+        if r["target"] is None:
+            continue
+        if not r["in_range"]:
+            errors.append("焦面：帧 %d 所需焦位 %.3fmm 超出调焦范围 "
+                          "%.3f–%.3fmm，机构无法到达"
+                          % (r["frame"], r["target"],
+                             params["focus_near"], params["focus_far"]))
+            break
+        if r["dt"] is not None and not r["settled"]:
+            if r["dt"] <= 1e-12:
+                errors.append("焦面：帧 %d 校正时码间隔为零，机构无移动"
+                              "时间，来不及稳定，请加降速/托带"
+                              % r["frame"])
+                break
+            move = r["speed"] * r["dt"]
+            errors.append("焦面：帧 %d 机构来不及稳定（需移动 %.3fmm、"
+                          "用时 %.3fs，超出速度 %.2fmm/s 或静定 %.2fs），"
+                          "请加降速/托带或人工锚点"
+                          % (r["frame"], move, r["dt"],
+                             params["motor_speed"], params["settle_time"]))
             break
 
     return errors

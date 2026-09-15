@@ -35,6 +35,11 @@ async function loadParams() {
   $("p_wsize").value = params.window_size;
   $("p_trac").value = params.traction_limit;
   $("p_safe").value = params.safe_margin;
+  $("p_dof").value = params.lens_dof;
+  $("p_fnear").value = params.focus_near;
+  $("p_ffar").value = params.focus_far;
+  $("p_mspeed").value = params.motor_speed;
+  $("p_settle").value = params.settle_time;
   $("version").textContent = "参数版本 v" + params.version;
 }
 
@@ -61,9 +66,12 @@ async function loadSegment() {
   $("svg").src = "/api/segments/" + segId + "/offset.svg?v=" + data.version;
   $("gateSvg").src = "/api/segments/" + segId
     + "/gate.svg?v=" + data.version + "&sig=" + data.gate.obs_sig;
+  $("focusSvg").src = "/api/segments/" + segId
+    + "/focus.svg?v=" + data.version + "&sig=" + data.focus.h_sig;
   renderResults();
   drawAll();
   drawGate();
+  if (typeof drawFocus === "function") drawFocus();
 }
 
 function renderResults() {
@@ -300,6 +308,11 @@ $("saveParams").onclick = async () => {
     window_size: +$("p_wsize").value,
     traction_limit: +$("p_trac").value,
     safe_margin: +$("p_safe").value,
+    lens_dof: +$("p_dof").value,
+    focus_near: +$("p_fnear").value,
+    focus_far: +$("p_ffar").value,
+    motor_speed: +$("p_mspeed").value,
+    settle_time: +$("p_settle").value,
   });
   await loadParams();
   await loadSegment();

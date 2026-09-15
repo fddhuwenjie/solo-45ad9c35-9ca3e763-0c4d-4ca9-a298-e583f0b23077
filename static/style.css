@@ -33,3 +33,15 @@ button.gtool.active { background:#e8b13c; color:#111; }
 #gateSvg { display:block; margin:8px 0; border:1px solid #333; }
 #g_frame { width:60px; }
 
+#focusWS { border-top:1px solid #333; padding-top:8px; }
+#focusBar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:8px 0; }
+button.ftool.active { background:#e8b13c; color:#111; }
+button.strat { background:#2c3a4a; }
+button.strat.active { background:#5aa0e0; color:#08131f; }
+#focusCanvas { cursor:crosshair; }
+#focusInfo { margin:6px 0; color:#bbb; font-size:13px; }
+#focusErr { color:#ff7766; white-space:pre-line; font-size:13px; }
+#focusErr:empty { display:none; }
+#focusSvg { display:block; margin:8px 0; border:1px solid #333; }
+#f_frame { width:60px; }
+

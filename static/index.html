@@ -18,6 +18,12 @@
   <label>窗口尺寸 mm <input id="p_wsize" type="number" step="0.1"></label>
   <label>牵引上限 mm <input id="p_trac" type="number" step="0.1"></label>
   <label>安全余量 mm <input id="p_safe" type="number" step="0.05"></label>
+  <span class="gsep">|</span>
+  <label>镜头景深 mm <input id="p_dof" type="number" step="0.01"></label>
+  <label>调焦近端 mm <input id="p_fnear" type="number" step="0.1"></label>
+  <label>调焦远端 mm <input id="p_ffar" type="number" step="0.1"></label>
+  <label>电机速度 mm/s <input id="p_mspeed" type="number" step="0.1"></label>
+  <label>静定时长 s <input id="p_settle" type="number" step="0.005"></label>
   <button id="saveParams">保存参数</button>
 </section>
 
@@ -65,6 +71,34 @@
   <img id="gateSvg" alt="稳定轨迹">
 </section>
 
+<section id="focusWS">
+  <h2>焦面排程工作区</h2>
+  <div id="focusBar">
+    <button id="f_prev">◀ 上一帧</button>
+    <span>帧 <input id="f_frame" type="number" min="0" value="0"> / <span id="f_count">0</span></span>
+    <button id="f_next">下一帧 ▶</button>
+    <span class="gsep">|</span>
+    <button data-ftool="C" class="ftool active">中央</button>
+    <button data-ftool="TL" class="ftool">左上</button>
+    <button data-ftool="TR" class="ftool">右上</button>
+    <button data-ftool="BL" class="ftool">左下</button>
+    <button data-ftool="BR" class="ftool">右下</button>
+    <button data-ftool="SB" class="ftool">接片前 SB</button>
+    <button data-ftool="SA" class="ftool">接片后 SA</button>
+    <button data-ftool="fanchor" class="ftool">焦点锚点</button>
+    <span class="gsep">|</span>
+    策略
+    <button data-strat="constant" class="strat">恒定</button>
+    <button data-strat="recommended" class="strat active">推荐</button>
+    <button data-strat="manual" class="strat">人工</button>
+    <span class="hint">点击画格五点位录入测高（弹出物距 mm）；接片前后在接缝两侧录 SB/SA；焦点锚点可上下拖动，右键删除</span>
+  </div>
+  <canvas id="focusCanvas" width="1100" height="340"></canvas>
+  <div id="focusInfo"></div>
+  <div id="focusErr"></div>
+  <img id="focusSvg" alt="焦域热图">
+</section>
+
 <section id="timeline">
   <h2>时间尺</h2>
   <div id="actionForm">
@@ -93,5 +127,6 @@
 <script src="/static/app.js"></script>
 <script src="/static/gate-geo.js"></script>
 <script src="/static/gate.js"></script>
+<script src="/static/focus.js"></script>
 </body>
 </html>

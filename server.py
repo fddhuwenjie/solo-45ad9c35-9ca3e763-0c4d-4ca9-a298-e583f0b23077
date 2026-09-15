@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS params (
     window_size REAL NOT NULL DEFAULT 10.4,
     traction_limit REAL NOT NULL DEFAULT 1.5,
     safe_margin REAL NOT NULL DEFAULT 0.3,
+    lens_dof REAL NOT NULL DEFAULT 0.25,
+    focus_near REAL NOT NULL DEFAULT 40.0,
+    focus_far REAL NOT NULL DEFAULT 60.0,
+    motor_speed REAL NOT NULL DEFAULT 8.0,
+    settle_time REAL NOT NULL DEFAULT 0.02,
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS segments (
@@ -31,7 +36,8 @@ CREATE TABLE IF NOT EXISTS segments (
     name TEXT NOT NULL,
     locked INTEGER NOT NULL DEFAULT 0,
     anchor_id INTEGER,
-    compute_cache TEXT
+    compute_cache TEXT,
+    focus_strategy TEXT NOT NULL DEFAULT 'recommended'
 );
 CREATE TABLE IF NOT EXISTS measurements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +74,21 @@ CREATE TABLE IF NOT EXISTS gate_keyframes (
     angle REAL NOT NULL DEFAULT 0.0,
     UNIQUE (segment_id, frame_index)
 );
+CREATE TABLE IF NOT EXISTS height_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id INTEGER NOT NULL REFERENCES segments(id),
+    frame_index INTEGER NOT NULL,
+    pos TEXT NOT NULL,
+    z REAL,
+    usable INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS focus_anchors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id INTEGER NOT NULL REFERENCES segments(id),
+    frame_index INTEGER NOT NULL,
+    focus REAL NOT NULL,
+    UNIQUE (segment_id, frame_index)
+);
 """
 
 
@@ -91,6 +112,26 @@ def init_db():
         pass
     try:  # 双边门位：区间补偿缓存
         conn.execute("ALTER TABLE segments ADD COLUMN gate_cache TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # 焦面排程：镜头景深、调焦范围、电机速度、静定时长
+    for col, ddl in (
+            ("lens_dof", "REAL NOT NULL DEFAULT 0.25"),
+            ("focus_near", "REAL NOT NULL DEFAULT 40.0"),
+            ("focus_far", "REAL NOT NULL DEFAULT 60.0"),
+            ("motor_speed", "REAL NOT NULL DEFAULT 8.0"),
+            ("settle_time", "REAL NOT NULL DEFAULT 0.02")):
+        try:
+            conn.execute("ALTER TABLE params ADD COLUMN %s %s" % (col, ddl))
+        except sqlite3.OperationalError:
+            pass
+    try:  # 焦面排程：策略选择（恒定/推荐/人工）
+        conn.execute("ALTER TABLE segments ADD COLUMN focus_strategy TEXT"
+                     " NOT NULL DEFAULT 'recommended'")
+    except sqlite3.OperationalError:
+        pass
+    try:  # 焦面排程：区间排程缓存
+        conn.execute("ALTER TABLE segments ADD COLUMN focus_cache TEXT")
     except sqlite3.OperationalError:
         pass
     if not conn.execute("SELECT 1 FROM params WHERE id = 1").fetchone():
@@ -132,6 +173,28 @@ def get_keyframes(conn, seg_id):
     return [dict(r) for r in rows]
 
 
+def get_heights(conn, seg_id):
+    rows = conn.execute(
+        "SELECT * FROM height_observations WHERE segment_id = ?"
+        " ORDER BY frame_index, pos", (seg_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_focus_anchors(conn, seg_id):
+    rows = conn.execute(
+        "SELECT * FROM focus_anchors WHERE segment_id = ?"
+        " ORDER BY frame_index", (seg_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def focus_frame_count(frames, edges, heights):
+    """焦面工作区帧范围：画格帧、双边观测、测高帧的并集。"""
+    n = gate_frame_count(frames, edges)
+    if heights:
+        n = max(n, max(h["frame_index"] for h in heights) + 1)
+    return n
+
+
 def gate_frame_count(frames, edges):
     """门位工作区帧范围：画格帧与双边观测帧的并集。"""
     n = len(frames)
@@ -155,6 +218,11 @@ def compute_segment(conn, seg_id):
     acts = get_actions(conn, seg_id)
     edges = get_edge_observations(conn, seg_id)
     keyframes = get_keyframes(conn, seg_id)
+    heights = get_heights(conn, seg_id)
+    focus_anchors = get_focus_anchors(conn, seg_id)
+    strategy = seg["focus_strategy"] or "recommended"
+    if strategy not in compute.FOCUS_STRATEGIES:
+        strategy = "recommended"
     # 缓存前缀只在同一参数版本下有效；版本不同则整段按当前参数重算，
     # 保证同一结果是单一计算基准，不拼合两个版本的帧。
     prefix = None
@@ -172,7 +240,27 @@ def compute_segment(conn, seg_id):
         params, edges, keyframes,
         gate_frame_count(frames, edges), cache=gate_cache)
     gate_errors = compute.validate_gate(params, edges, keyframes, gate)
+
+    # 焦面排程：与门位同一份参数版本、同一校正时间尺；条带圈记的接片
+    # 所在帧号一并传给接片基准断裂校验。
+    nf = focus_frame_count(frames, edges, heights)
+    splice_frames = []
+    if frames:
+        for sp in compute.markers(meas, "splice"):
+            idx = min(range(len(frames)),
+                      key=lambda i: abs(frames[i]["x"] - sp["x"]))
+            splice_frames.append(idx)
+        splice_frames = sorted(set(splice_frames))
+    focus_cache = json.loads(seg["focus_cache"]) \
+        if seg["focus_cache"] else None
+    focus = compute.build_focus(
+        params, heights, focus_anchors, frames, strategy,
+        cache=focus_cache, n_frames=nf)
+    focus_errors = compute.validate_focus(
+        params, heights, focus_anchors, frames, focus,
+        splice_frames=splice_frames, n_frames=nf)
     errors.extend(gate_errors)
+    errors.extend(focus_errors)
     return {
         "segment": dict(seg),
         "params": params,
@@ -186,6 +274,10 @@ def compute_segment(conn, seg_id):
         "gate_keyframes": keyframes,
         "gate": gate,
         "gate_errors": gate_errors,
+        "height_observations": heights,
+        "focus_anchors": focus_anchors,
+        "focus": focus,
+        "focus_errors": focus_errors,
     }
 
 
@@ -194,6 +286,15 @@ def save_gate_cache(conn, seg_id, gate):
     cache = {"version": gate["version"], "obs_sig": gate["obs_sig"],
              "zones": gate["cache"]["zones"]}
     conn.execute("UPDATE segments SET gate_cache = ? WHERE id = ?",
+                 (json.dumps(cache, ensure_ascii=False), seg_id))
+
+
+def save_focus_cache(conn, seg_id, focus):
+    """只持久化焦面区间缓存（参数版本 + 测高稿指纹 + 策略 + 锚点签名）。"""
+    cache = {"version": focus["version"], "h_sig": focus["h_sig"],
+             "strategy": focus["strategy"],
+             "zones": focus["cache"]["zones"]}
+    conn.execute("UPDATE segments SET focus_cache = ? WHERE id = ?",
                  (json.dumps(cache, ensure_ascii=False), seg_id))
 
 
@@ -344,6 +445,167 @@ def gate_svg(result):
     return "".join(parts)
 
 
+def focus_svg(result):
+    """焦域热图 SVG，与重演 JSON、走带卡同源。
+
+    主面板：纵轴物距（翘曲包络 z_near–z_far 灰色带，测点位置蓝点），
+    下达焦位金线，景深窗 [focus±dof/2] 金色半透明带；
+    下面板：逐帧清晰覆盖比例（≥下限绿色，不足红色），空齿帧灰色缺口。
+    """
+    focus = result["focus"]
+    rows = focus["frames"]
+    params = result["params"]
+    dof = params["lens_dof"]
+    w, h, pad = 720, 280, 34
+    if not rows:
+        return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">'
+                '<text x="20" y="40">无焦面数据</text></svg>' % (w, h))
+    xs = [r["frame"] for r in rows]
+    x0, x1 = xs[0], xs[-1]
+
+    def px(i):
+        return pad + (w - 2 * pad) * (i - x0) / max(1, x1 - x0)
+
+    zvals = [v for r in rows for v in (r["z_near"], r["z_far"], r["focus"])
+             if v is not None]
+    if not zvals:
+        return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">'
+                '<text x="20" y="40">无测高点</text></svg>' % (w, h))
+    zlo, zhi = min(zvals) - dof, max(zvals) + dof
+    top0, bot0 = 24.0, 176.0
+
+    def pz(z):
+        return top0 + (bot0 - top0) * (z - zlo) / max(1e-9, zhi - zlo)
+
+    parts = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+        'font-family="monospace" font-size="11">' % (w, h),
+        '<rect width="%d" height="%d" fill="#141414"/>' % (w, h),
+    ]
+
+    # 调焦范围限位线
+    parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#553"/>'
+                 % (pad, pz(params["focus_near"]), w - pad,
+                    pz(params["focus_near"])))
+    parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#553"/>'
+                 % (pad, pz(params["focus_far"]), w - pad,
+                    pz(params["focus_far"])))
+
+    # 翘曲包络带 + 测点
+    near_pts, far_pts = [], []
+    bw = max(2.0, (w - 2 * pad) / max(1, x1 - x0) - 1.0)
+    for r in rows:
+        if r["z_near"] is None:
+            continue
+        xn, ynear, yfar = px(r["frame"]), pz(r["z_near"]), pz(r["z_far"])
+        parts.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                     'stroke="#5a6a8a" stroke-width="%.1f"/>'
+                     % (xn, ynear, xn, yfar, bw))
+        near_pts.append((xn, ynear))
+        far_pts.append((xn, yfar))
+    npoly = " ".join("%.1f,%.1f" % p for p in near_pts)
+    fpoly = " ".join("%.1f,%.1f" % p for p in far_pts)
+    if npoly:
+        parts.append('<polyline points="%s" fill="none" stroke="#7fb8ff" '
+                     'stroke-width="1.2"/>' % npoly)
+        parts.append('<polyline points="%s" fill="none" stroke="#7fb8ff" '
+                     'stroke-width="1.2"/>' % fpoly)
+
+    # 各标准测点（淡蓝小点）
+    for r in rows:
+        bp = r.get("by_pos")
+        if not bp:
+            continue
+        for pos in compute.FOCUS_CANON:
+            z = bp.get(pos)
+            if z is not None:
+                parts.append('<circle cx="%.1f" cy="%.1f" r="1.6" '
+                             'fill="#9cc8ff"/>' % (px(r["frame"]), pz(z)))
+
+    # 景深窗带（按下达焦位）与焦位轨迹
+    bar_w = max(3.0, (w - 2 * pad) / max(1, x1 - x0) - 1.0)
+    for r in rows:
+        if r["focus"] is None or r["skipped"]:
+            continue
+        ytop = pz(r["focus"] + dof / 2.0)
+        ybot = pz(r["focus"] - dof / 2.0)
+        parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                     'fill="#e8b13c" opacity="0.16"/>'
+                     % (px(r["frame"]) - bar_w / 2.0, ytop,
+                        bar_w, ybot - ytop))
+    fpts = " ".join("%.1f,%.1f" % (px(r["frame"]), pz(r["focus"]))
+                    for r in rows if r["focus"] is not None
+                    and not r["skipped"])
+    if fpts:
+        parts.append('<polyline points="%s" fill="none" stroke="#e8b13c" '
+                     'stroke-width="1.8"/>' % fpts)
+    # 推荐目标（被夹住/机构跟不动时可能与实际不同）：虚金线
+    tpts = " ".join("%.1f,%.1f" % (px(r["frame"]), pz(r["target"]))
+                    for r in rows if r.get("target") is not None
+                    and not r["skipped"]
+                    and abs(r["target"] - r["focus"]) > 1e-9)
+    if tpts:
+        parts.append('<polyline points="%s" fill="none" stroke="#ffd766" '
+                     'stroke-width="1.0" stroke-dasharray="3 3"/>' % tpts)
+    # 人工锚点
+    for a in focus["anchors"]:
+        parts.append('<circle cx="%.1f" cy="%.1f" r="3.6" fill="#7fd07f"/>'
+                     % (px(a["frame_index"]), pz(a["focus"])))
+
+    parts.append('<text x="%d" y="14" fill="#9cf">翘曲包络/测点</text>'
+                 '<text x="150" y="14" fill="#e8b13c">下达焦位/景深窗</text>'
+                 '<text x="300" y="14" fill="#7fd07f">焦点锚点</text>' % pad)
+
+    # 覆盖比例面板
+    cov_mid = 232.0
+    parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#555"/>'
+                 % (pad, cov_mid, w - pad, cov_mid))
+    bar_h = 30.0
+    for r in rows:
+        c = r["coverage"]
+        x = px(r["frame"])
+        if c is None:
+            color = "#333"   # 空齿/无包络
+            hgt = bar_h
+        elif c >= compute.MIN_FOCUS_COVERAGE:
+            color, hgt = "#7fd07f", bar_h * c
+        else:
+            color, hgt = "#ff5544", bar_h * c
+        parts.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                     'fill="%s"/>'
+                     % (x - 1.5, cov_mid - hgt,
+                        max(2.0, (w - 2 * pad) / max(1, x1 - x0) - 1.0),
+                        hgt, color))
+    parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" '
+                 'stroke="#ffaa33" stroke-dasharray="4 3"/>'
+                 % (pad, cov_mid - bar_h * compute.MIN_FOCUS_COVERAGE,
+                    w - pad, cov_mid - bar_h * compute.MIN_FOCUS_COVERAGE))
+    parts.append('<text x="%d" y="206" fill="#999">物距 mm · 策略 %s</text>'
+                 '<text x="%d" y="%d" fill="#999">清晰覆盖比例（下限 '
+                 '%.0f%%）</text>'
+                 % (pad, compute.FOCUS_STRATEGY_CN[focus["strategy"]],
+                    pad, cov_mid + 28,
+                    100 * compute.MIN_FOCUS_COVERAGE))
+
+    # 校验问题首帧钉红
+    if result["focus_errors"]:
+        first = None
+        for token in result["focus_errors"][0].split():
+            if token.isdigit():
+                first = int(token)
+                break
+        if first is not None and x0 <= first <= x1:
+            parts.append('<line x1="%.1f" y1="20" x2="%.1f" y2="%d" '
+                         'stroke="#ff5544" stroke-width="2"/>'
+                         % (px(first), px(first), h - 24))
+    parts.append('<text x="%d" y="%d" fill="#999">参数版本 v%d · 测高稿 %s '
+                 '· 景深 %.2fmm · 电机 %.1fmm/s</text>'
+                 % (pad, h - 8, result["version"], focus["h_sig"],
+                    dof, params["motor_speed"]))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "FilmPath/1.0"
 
@@ -405,6 +667,45 @@ class Handler(BaseHTTPRequestHandler):
                     if not result:
                         return self._json({"error": "not found"}, 404)
                     return self._send(200, gate_svg(result), "image/svg+xml")
+                if parts[3] == "focus.svg":
+                    result = compute_segment(conn, seg_id)
+                    if not result:
+                        return self._json({"error": "not found"}, 404)
+                    return self._send(200, focus_svg(result), "image/svg+xml")
+                if parts[3] == "focus_replay":
+                    # 重演 JSON：与焦域热图、走带卡固定同一测高稿与策略版本
+                    result = compute_segment(conn, seg_id)
+                    if not result:
+                        return self._json({"error": "not found"}, 404)
+                    f = result["focus"]
+                    return self._json({
+                        "version": result["version"],
+                        "h_sig": f["h_sig"],
+                        "strategy": f["strategy"],
+                        "lens": {
+                            "dof": result["params"]["lens_dof"],
+                            "focus_near": result["params"]["focus_near"],
+                            "focus_far": result["params"]["focus_far"],
+                            "motor_speed": result["params"]["motor_speed"],
+                            "settle_time": result["params"]["settle_time"]},
+                        "anchors": f["anchors"],
+                        "ambiguous_frames": f["ambiguous_frames"],
+                        "errors": result["focus_errors"],
+                        "frames": [{
+                            "frame": r["frame"],
+                            "tc": next((x["tc"] for x in result["frames"]
+                                        if x["frame"] == r["frame"]), None),
+                            "z_near": r["z_near"], "z_far": r["z_far"],
+                            "target": r["target"], "focus": r["focus"],
+                            "speed": (None if r["speed"] == float("inf")
+                                      or r["speed"] == float("-inf")
+                                      else r["speed"]),
+                            "dt": r["dt"], "settled": r["settled"],
+                            "in_range": r["in_range"],
+                            "coverage": r["coverage"],
+                            "skipped": r["skipped"],
+                        } for r in f["frames"]],
+                    })
                 if parts[3] == "transport_card":
                     result = compute_segment(conn, seg_id)
                     if not result:
@@ -412,6 +713,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({
                         "version": result["version"],
                         "obs_sig": result["gate"]["obs_sig"],
+                        "h_sig": result["focus"]["h_sig"],
+                        "focus_strategy": result["focus"]["strategy"],
                         "segment": result["segment"]["name"],
                         "locked": bool(result["segment"]["locked"]),
                         "frames": len(result["frames"]),
@@ -422,6 +725,18 @@ class Handler(BaseHTTPRequestHandler):
                             "keyframes": len(result["gate"]["keyframes"]),
                             "gate_frames": len(result["gate"]["frames"]),
                             "errors": result["gate_errors"],
+                        },
+                        "focus": {
+                            "height_points": len(
+                                [h for h in result["height_observations"]
+                                 if h.get("usable", 1)]),
+                            "anchors": len(result["focus"]["anchors"]),
+                            "focus_frames": len(result["focus"]["frames"]),
+                            "min_coverage": min(
+                                (r["coverage"] for r in result["focus"]["frames"]
+                                 if r["coverage"] is not None),
+                                default=None),
+                            "errors": result["focus_errors"],
                         },
                     })
         finally:
@@ -435,9 +750,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/params":
                 fields = ("film_width", "nominal_pitch", "window_offset",
-                          "window_size", "traction_limit", "safe_margin")
+                          "window_size", "traction_limit", "safe_margin",
+                          "lens_dof", "focus_near", "focus_far",
+                          "motor_speed", "settle_time")
+                cur_params = get_params(conn)
                 sets = ", ".join("%s = ?" % f for f in fields)
-                vals = [float(body[f]) for f in fields]
+                vals = [float(body[f]) if f in body else cur_params[f]
+                        for f in fields]
                 conn.execute(
                     "UPDATE params SET %s, version = version + 1 WHERE id = 1"
                     % sets, vals)
@@ -522,6 +841,110 @@ class Handler(BaseHTTPRequestHandler):
                     save_gate_cache(conn, seg_id, result["gate"])
                     conn.commit()
                     return self._json(result["gate"])
+
+                # ---- 焦面排程 ----
+
+                if (len(parts) == 5 and parts[3] == "heights"):
+                    h_id = int(parts[4])
+                    obs = conn.execute(
+                        "SELECT * FROM height_observations WHERE id = ?"
+                        " AND segment_id = ?", (h_id, seg_id)).fetchone()
+                    if not obs:
+                        return self._json({"error": "not found"}, 404)
+                    zval = body.get("z", obs["z"])
+                    conn.execute(
+                        "UPDATE height_observations SET z = ?, usable = ?"
+                        " WHERE id = ?",
+                        (zval,
+                         1 if body.get("usable", obs["usable"]) else 0,
+                         h_id))
+                    conn.commit()
+                    result = compute_segment(conn, seg_id)
+                    save_focus_cache(conn, seg_id, result["focus"])
+                    conn.commit()
+                    return self._json(result["focus"])
+
+                if (len(parts) == 5 and parts[3] == "focus_anchors"):
+                    fa_id = int(parts[4])
+                    fa = conn.execute(
+                        "SELECT * FROM focus_anchors WHERE id = ?"
+                        " AND segment_id = ?", (fa_id, seg_id)).fetchone()
+                    if not fa:
+                        return self._json({"error": "not found"}, 404)
+                    focus = float(body["focus"]) if "focus" in body \
+                        else fa["focus"]
+                    conn.execute(
+                        "UPDATE focus_anchors SET focus = ? WHERE id = ?",
+                        (focus, fa_id))
+                    conn.commit()
+                    result = compute_segment(conn, seg_id)
+                    # 编辑锚点仅更新夹在相邻锚点间的结果（区间缓存）
+                    save_focus_cache(conn, seg_id, result["focus"])
+                    conn.commit()
+                    return self._json(result["focus"])
+
+                if sub == "heights":
+                    # Canvas 画格测高：frame_index + pos(C/TL/TR/BL/BR/SB/SA)
+                    # + z 物距；usable=0 表示该点废读（不参与拟合）
+                    pos = body.get("pos")
+                    if pos not in (compute.FOCUS_CANON
+                                   + (compute.FOCUS_SPLICE_PRE,
+                                      compute.FOCUS_SPLICE_POST)):
+                        return self._json(
+                            {"error": "pos 须为 C/TL/TR/BL/BR/SB/SA"}, 400)
+                    cur = conn.execute(
+                        "INSERT INTO height_observations (segment_id,"
+                        " frame_index, pos, z, usable) VALUES (?,?,?,?,?)",
+                        (seg_id, int(body["frame_index"]), pos,
+                         body.get("z"),
+                         1 if body.get("usable", True) else 0))
+                    conn.commit()
+                    result = compute_segment(conn, seg_id)
+                    save_focus_cache(conn, seg_id, result["focus"])
+                    conn.commit()
+                    return self._json({"id": cur.lastrowid,
+                                       "focus": result["focus"]}, 201)
+
+                if sub == "focus_anchors":
+                    fi = int(body["frame_index"])
+                    dup = conn.execute(
+                        "SELECT 1 FROM focus_anchors WHERE segment_id = ?"
+                        " AND frame_index = ?", (seg_id, fi)).fetchone()
+                    if dup:
+                        return self._json(
+                            {"error": "帧 %d 已有焦点锚点，请拖动或删除后重建"
+                             % fi}, 400)
+                    if "focus" in body:
+                        val = float(body["focus"])
+                    else:
+                        dk = compute.default_focus_anchor(
+                            get_params(conn), get_heights(conn, seg_id), fi)
+                        val = dk["focus"]
+                    cur = conn.execute(
+                        "INSERT INTO focus_anchors (segment_id, frame_index,"
+                        " focus) VALUES (?,?,?)", (seg_id, fi, val))
+                    conn.commit()
+                    result = compute_segment(conn, seg_id)
+                    save_focus_cache(conn, seg_id, result["focus"])
+                    conn.commit()
+                    return self._json({"id": cur.lastrowid,
+                                       "focus": result["focus"]}, 201)
+
+                if sub == "focus_strategy":
+                    strat = body.get("strategy")
+                    if strat not in compute.FOCUS_STRATEGIES:
+                        return self._json(
+                            {"error": "strategy 须为 constant/recommended/manual"},
+                            400)
+                    conn.execute(
+                        "UPDATE segments SET focus_strategy = ? WHERE id = ?",
+                        (strat, seg_id))
+                    conn.commit()
+                    result = compute_segment(conn, seg_id)
+                    save_focus_cache(conn, seg_id, result["focus"])
+                    conn.commit()
+                    return self._json({"strategy": strat,
+                                       "focus": result["focus"]})
 
                 if sub == "edges":
                     # 逐帧标记左/右齿孔中心、片边、不可用缺口（usable=0）
@@ -644,6 +1067,22 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[1] in ("edges", "keyframes")):
                 table = ("edge_observations" if parts[1] == "edges"
                          else "gate_keyframes")
+                seg = conn.execute(
+                    "SELECT s.locked FROM segments s JOIN %s t"
+                    " ON t.segment_id = s.id WHERE t.id = ?" % table,
+                    (int(parts[2]),)).fetchone()
+                if not seg:
+                    return self._json({"error": "not found"}, 404)
+                if seg["locked"]:
+                    return self._json({"error": "段已锁定，只读"}, 409)
+                conn.execute("DELETE FROM %s WHERE id = ?" % table,
+                             (int(parts[2]),))
+                conn.commit()
+                return self._json({"deleted": True})
+            if (len(parts) == 3 and parts[0] == "api"
+                    and parts[1] in ("heights", "focus_anchors")):
+                table = ("height_observations" if parts[1] == "heights"
+                         else "focus_anchors")
                 seg = conn.execute(
                     "SELECT s.locked FROM segments s JOIN %s t"
                     " ON t.segment_id = s.id WHERE t.id = ?" % table,
